@@ -1,0 +1,67 @@
+# Builds a JDK tzdb.dat from OpenJDK's own tz database, plus the small verifier
+# class used to prove a patched image is correct.
+#
+# The JDK never reads /usr/share/zoneinfo for zone rules - it carries a compiled
+# copy at $JAVA_HOME/lib/tzdb.dat. This stage reproduces exactly what the OpenJDK
+# build does: take build/tools/tzdb, add the four java.time.zone sources with the
+# package renamed (see OpenJDK's CopyInterimTZDB.gmk), compile, and run the
+# compiler over src/java.base/share/data/tzdata.
+#
+#   docker build -f Dockerfile.tzdb --target export -o out .
+#
+# leaves out/tzdb.dat and out/TzVerify.class on the host.
+
+ARG BUILDER_IMAGE=eclipse-temurin:21-jdk
+FROM ${BUILDER_IMAGE} AS builder
+
+# OpenJDK ref to take the tz database and tooling from. A tag such as
+# jdk-25+36 pins it; master tracks the newest tzdata OpenJDK has integrated.
+ARG JDK_REF=master
+ARG GH=https://raw.githubusercontent.com/openjdk/jdk
+
+WORKDIR /build
+
+# 1. the compiler itself
+RUN set -eux; \
+    mkdir -p src/build/tools/tzdb; \
+    for f in TzdbZoneRulesCompiler.java TzdbZoneRulesProvider.java; do \
+      curl -fsSL -o "src/build/tools/tzdb/$f" \
+        "${GH}/${JDK_REF}/make/jdk/src/classes/build/tools/tzdb/$f"; \
+    done
+
+# 2. the four java.time.zone sources it needs, package-renamed exactly as
+#    OpenJDK's CopyInterimTZDB.gmk does
+RUN set -eux; \
+    for f in ZoneRules.java ZoneOffsetTransition.java ZoneOffsetTransitionRule.java Ser.java; do \
+      curl -fsSL "${GH}/${JDK_REF}/src/java.base/share/classes/java/time/zone/$f" \
+        | sed -e 's/package java.time.zone/package build.tools.tzdb/' \
+        > "src/build/tools/tzdb/$f"; \
+    done; \
+    javac -nowarn -d classes $(find src -name '*.java')
+
+# 3. OpenJDK's tz database. jdk11_backward carries the SystemV/* aliases that the
+#    IANA tarball does not ship - leaving it out silently drops 13 zone ids.
+RUN set -eux; \
+    mkdir -p tzdata; \
+    for f in VERSION africa antarctica asia australasia europe northamerica \
+             southamerica backward etcetera gmt jdk11_backward; do \
+      curl -fsSL -o "tzdata/$f" "${GH}/${JDK_REF}/src/java.base/share/data/tzdata/$f"; \
+    done; \
+    grep -o 'tzdata[0-9a-z]*' tzdata/VERSION | tail -1 > tzdata.version; \
+    cat tzdata.version
+
+RUN set -eux; \
+    java -cp classes build.tools.tzdb.TzdbZoneRulesCompiler \
+      -srcdir tzdata -dstfile /build/tzdb.dat \
+      africa antarctica asia australasia europe northamerica southamerica \
+      backward etcetera gmt jdk11_backward; \
+    ls -l /build/tzdb.dat
+
+# 4. the verifier, compiled at release 8 so it also runs on a JDK 8 or a JRE image
+COPY TzVerify.java /build/TzVerify.java
+RUN javac --release 8 -d /build/verify /build/TzVerify.java
+
+FROM scratch AS export
+COPY --from=builder /build/tzdb.dat /tzdb.dat
+COPY --from=builder /build/tzdata.version /tzdata.version
+COPY --from=builder /build/verify/TzVerify.class /TzVerify.class
